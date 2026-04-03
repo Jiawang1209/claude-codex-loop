@@ -79,36 +79,50 @@ Each message carries a `source` field (`"claude"` or `"codex"`). The bridge neve
 
 ## Quick Start
 
-### Install via Plugin Marketplace (recommended)
+### Install from a local marketplace (current supported workflow)
 
-Install Claude Codex Loop directly from Claude Code using the plugin marketplace:
+Claude Codex Loop currently ships a repository-local marketplace manifest. The supported install flow is to clone this repository, register the repository root as a local marketplace, then install the plugin from that marketplace:
 
 ```bash
-# 1. In Claude Code, add the Claude Codex Loop marketplace
-/plugin marketplace add liuyue/claude-codex-loop
+# 1. Clone the repository
+git clone https://github.com/liuyue/claude-codex-loop.git
+cd claude-codex-loop
 
-# 2. Install the plugin
+# 2. Register this repository as a local Claude Code marketplace
+/plugin marketplace add .
+
+# 3. Install the plugin
 /plugin install claude-codex-loop@claude-codex-loop
 
-# 3. Reload plugins to activate
+# 4. Reload plugins to activate
 /reload-plugins
 ```
 
-Then install the CLI tool:
+Then install the CLI tool and generate project config:
 
 ```bash
-# 4. Install the CLI globally
+# 5. Install dependencies and link the local CLI
+bun install
+bun link
+
+# 6. Install the CLI globally
 npm install -g claude-codex-loop
 
-# 5. Generate project config (optional)
+# 7. Generate project config (optional)
 ccl init
 
-# 6. Start Claude Code with Claude Codex Loop channel enabled
+# 8. Start Claude Code with Claude Codex Loop channel enabled
 ccl claude
 
-# 7. Start Codex TUI connected to the bridge (in another terminal)
+# 9. Start Codex TUI connected to the bridge (in another terminal)
 ccl codex
 ```
+
+If you prefer the project helper, `claude-codex-loop dev` performs the local marketplace registration and plugin install for you.
+
+> **Important:** The repository does not currently document a published remote marketplace endpoint. A command such as `/plugin marketplace add liuyue/claude-codex-loop` may not work unless a remote marketplace has been published separately.
+
+> **Next step for maintainers:** See [docs/remote-marketplace-publishing.md](docs/remote-marketplace-publishing.md) for the recommended path to a real remote marketplace release flow.
 
 > **Tip:** `ccl` is a short alias for `claude-codex-loop`. Both commands are identical — use whichever you prefer.
 
@@ -116,14 +130,15 @@ That's it. The daemon starts automatically when needed and reconnects if restart
 
 #### Updating the plugin
 
-When a new version is released, update from Claude Code:
+For local marketplace installs, pull the latest repository changes, then re-run:
 
 ```bash
-/plugin marketplace update claude-codex-loop
+bun run build:plugin
+claude-codex-loop dev
 /reload-plugins
 ```
 
-Or enable auto-update: run `/plugin` → **Marketplaces** tab → select **claude-codex-loop** → **Enable auto-update**.
+Once a real remote marketplace is published, marketplace update commands can be documented separately.
 
 ### Install for local development
 
@@ -136,14 +151,17 @@ cd claude-codex-loop
 bun install
 bun link
 
-# 2. Set up local plugin + project config
+# 2. Build plugin bundles
+bun run build:plugin
+
+# 3. Set up local plugin + project config
 claude-codex-loop dev     # Register local marketplace + install plugin
 claude-codex-loop init    # Check dependencies, generate .claude-codex-loop/config.json
 
-# 3. Start Claude Code with Claude Codex Loop plugin loaded
+# 4. Start Claude Code with Claude Codex Loop plugin loaded
 claude-codex-loop claude
 
-# 4. Start Codex TUI connected to the bridge (in another terminal)
+# 5. Start Codex TUI connected to the bridge (in another terminal)
 claude-codex-loop codex
 ```
 
@@ -151,7 +169,7 @@ claude-codex-loop codex
 
 #### Updating after code changes
 
-After modifying Claude Codex Loop source code, re-run `claude-codex-loop dev` to sync changes to the plugin cache, then restart Claude Code or run `/reload-plugins` in an active session.
+After modifying Claude Codex Loop source code, re-run `bun run build:plugin` and `claude-codex-loop dev` to sync changes to the plugin cache, then restart Claude Code or run `/reload-plugins` in an active session.
 
 ## CLI Reference
 
@@ -307,4 +325,3 @@ Codex runs in a sandboxed environment that **blocks all writes to the `.git` dir
 This project was built collaboratively by **Claude Code** (Anthropic) and **Codex** (OpenAI), communicating through Claude Codex Loop itself -- the very tool they were building together. A human developer coordinated the effort, assigning tasks, reviewing progress, and directing the two agents to work in parallel and review each other's output.
 
 In other words, Claude Codex Loop is its own proof of concept: two AI agents from different providers, connected in real time, shipping code side by side.
-

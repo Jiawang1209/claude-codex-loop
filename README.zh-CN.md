@@ -81,36 +81,50 @@ Claude Codex Loop 采用两层进程结构：
 
 ## Quick Start
 
-### 通过插件市场安装（推荐）
+### 通过本地 marketplace 安装（当前支持的方式）
 
-在 Claude Code 中直接安装 Claude Codex Loop 插件：
+Claude Codex Loop 当前提供的是仓库内置的 marketplace manifest。推荐的安装方式是先克隆仓库，再把仓库根目录注册成 Claude Code 的本地 marketplace，然后从这个 marketplace 安装插件：
 
 ```bash
-# 1. 在 Claude Code 中，添加 Claude Codex Loop 市场
-/plugin marketplace add liuyue/claude-codex-loop
+# 1. 克隆仓库
+git clone https://github.com/liuyue/claude-codex-loop.git
+cd claude-codex-loop
 
-# 2. 安装插件
+# 2. 将当前仓库注册为本地 Claude Code marketplace
+/plugin marketplace add .
+
+# 3. 安装插件
 /plugin install claude-codex-loop@claude-codex-loop
 
-# 3. 重新加载插件以激活
+# 4. 重新加载插件以激活
 /reload-plugins
 ```
 
-然后安装 CLI 工具：
+然后安装 CLI 并生成项目配置：
 
 ```bash
-# 4. 全局安装 CLI
+# 5. 安装依赖并链接本地 CLI
+bun install
+bun link
+
+# 6. 全局安装 CLI
 npm install -g claude-codex-loop
 
-# 5. 生成项目配置（可选）
+# 7. 生成项目配置（可选）
 ccl init
 
-# 6. 启动 Claude Code（自动加载 Claude Codex Loop channel）
+# 8. 启动 Claude Code（自动加载 Claude Codex Loop channel）
 ccl claude
 
-# 7. 在另一个终端启动 Codex TUI 连接 Bridge
+# 9. 在另一个终端启动 Codex TUI 连接 Bridge
 ccl codex
 ```
+
+如果你更想用项目封装的辅助命令，也可以直接运行 `claude-codex-loop dev`，它会帮你完成本地 marketplace 注册和插件安装。
+
+> **重要说明：** 这个仓库目前没有文档证明已经发布了可远程添加的 marketplace。因此 `/plugin marketplace add liuyue/claude-codex-loop` 这类写法不应默认视为可用，除非后续单独发布了远程 marketplace。
+
+> **维护者后续工作：** 如需把它做成真正可远程安装的 marketplace，请参考 [docs/remote-marketplace-publishing.md](docs/remote-marketplace-publishing.md)。
 
 > **提示：** `ccl` 是 `claude-codex-loop` 的简写别名，两个命令完全等价，用哪个都行。
 
@@ -118,14 +132,15 @@ ccl codex
 
 #### 更新插件
 
-新版本发布后，在 Claude Code 中更新：
+对于本地 marketplace 安装，先拉取仓库最新代码，然后重新执行：
 
 ```bash
-/plugin marketplace update claude-codex-loop
+bun run build:plugin
+claude-codex-loop dev
 /reload-plugins
 ```
 
-或启用自动更新：执行 `/plugin` → **Marketplaces** 标签页 → 选择 **claude-codex-loop** → **Enable auto-update**。
+等真正的远程 marketplace 发布后，再单独补充 `/plugin marketplace update` 这类远程更新说明。
 
 ### 本地开发安装
 
@@ -138,14 +153,17 @@ cd claude-codex-loop
 bun install
 bun link
 
-# 2. 安装本地插件 + 生成项目配置
+# 2. 构建插件 bundle
+bun run build:plugin
+
+# 3. 安装本地插件 + 生成项目配置
 claude-codex-loop dev     # 注册本地 marketplace + 安装插件
 claude-codex-loop init    # 检查依赖、生成 .claude-codex-loop/config.json
 
-# 3. 启动 Claude Code（自动加载 Claude Codex Loop 插件）
+# 4. 启动 Claude Code（自动加载 Claude Codex Loop 插件）
 claude-codex-loop claude
 
-# 4. 在另一个终端启动 Codex TUI 连接 Bridge
+# 5. 在另一个终端启动 Codex TUI 连接 Bridge
 claude-codex-loop codex
 ```
 
@@ -153,7 +171,7 @@ claude-codex-loop codex
 
 #### 修改代码后更新
 
-修改 Claude Codex Loop 源码后，重新执行 `claude-codex-loop dev` 同步插件到缓存，然后重启 Claude Code 或在活跃会话中执行 `/reload-plugins`。
+修改 Claude Codex Loop 源码后，重新执行 `bun run build:plugin` 和 `claude-codex-loop dev` 同步插件到缓存，然后重启 Claude Code 或在活跃会话中执行 `/reload-plugins`。
 
 ## CLI 命令参考
 
@@ -309,4 +327,3 @@ Codex 运行在沙箱环境中，**禁止对 `.git` 目录进行任何写操作*
 这个项目由 **Claude Code**（Anthropic）和 **Codex**（OpenAI）通过 Claude Codex Loop 本身进行实时双向通信，在人类开发者的指挥下协作完成。开发者负责分配任务、审查进度，并指挥两个 Agent 并行工作、互相 review。
 
 换句话说，Claude Codex Loop 就是它自己的 proof of concept：两个来自不同厂商的 AI Agent，通过实时连接，肩并肩地交付代码。
-
