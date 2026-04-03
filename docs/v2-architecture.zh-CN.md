@@ -1,0 +1,1028 @@
+# AgentBridge v2 架构设计
+
+> 整理自 2026-03-22 Claude + Codex 架构讨论，含二次评审反馈。
+
+## 1. 当前问题
+
+### 架构层面问题
+
+- 当前 daemon 使用单一的逻辑 Claude 连接点（`attachedClaude`），新连接必然替换旧连接。
+- 没有 room 或 session 隔离模型，所有流量都经过同一条全局路由路径。
+- 路由实质上是全局的一对一绑定，不支持作用域隔离。
+- Daemon 职责过载：消息路由、Codex 生命周期管理、TUI/代理管理、bridge 状态维护全部耦合在一起。
+- 当前架构无法干净地扩展到多种 agent 类型或多组并发 agent 配对。
+
+### 当前实现的已知限制
+
+- 目前仅转发 `agentMessage`。
+- `commandExecution`、`fileChange` 等中间运行时事件不会被转发。
+- 仅支持一个活跃的 Codex 线程。
+- 仅支持一个 Claude 前台连接；新连接会替换旧连接。
+- 当前的 reply 流程假定单一隐式目标，而非显式的 room 或 agent 路由。
+
+### v2 需要解决的目标
+
+> **与 v1 的关系**：以下部分能力已在 [v1 路线图](v1-roadmap.zh-CN.md) 中通过 prompt contract 提供了单桥轻量版。v2 的目标不是重做这些能力，而是将它们提升到多 agent、room-aware、协议级的正式基础设施。
+
+- **多会话支持**：同时运行多个 Claude 和 Codex 实例（v1 无法支持，纯 v2 能力）
+- **第三方 agent 集成**：如 Gemini CLI，需要 Room 模型和多出口路由（v1 无法支持，纯 v2 能力）
+- **Room-aware 智能消息过滤**：v1 通过 prompt contract + marker 提供了单桥版过滤；v2 将其提升为多 room、多 agent 场景下的协议级过滤与路由
+- **协议级显式寻址**：v1 通过 `@codex:` / `@claude:` 前缀提供了语义约定；v2 将其正式化为协议层的 `to` / `mentions` 字段
+- **多 agent 轮次协调**：v1 通过 turn notifications + attention window 提供了单桥协调；v2 将其扩展为 policy-backed 的多 agent 协调
+- **多 agent 协作模式**：v1.3 通过 prompt contract 提供了 role contract + thinking patterns；v2/v3 将其建立在正式的 policy 和 room 基础设施之上
+
+## 2. 核心变化
+
+当前 daemon 同时承担消息路由和 Codex 运行时管理两个角色。这种耦合是多 agent 支持困难的结构性根因。
+
+### Daemon 的新角色
+
+v2 中，daemon 变为纯消息路由器。其核心职责收敛为三项：
+
+- Agent 注册与认证
+- Room 与分配状态管理
+- 消息和生命周期事件的路由
+
+### 从 Daemon 中移出的职责
+
+- **Agent 运行时生命周期管理** — 移交给各自的 adapter 或外部 supervisor
+- **运行时特定逻辑** — Codex app-server 管理、TUI 代理管理等不再由 daemon 负责
+- **策略决策** — 自动配对、语义路由、轮次协调属于 Policy 层，不属于核心路由器
+
+### 设计原则
+
+- 路由器保持最小化、通用化、agent 无关化
+- 新增 agent 类型只需添加 adapter，不需要扩展 daemon 的特定逻辑
+- Daemon 管理的是通信拓扑，而非 agent 运行时内部细节
+
+下一章展示由此形成的高层架构。
+
+## 3. 架构总览
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                     AgentBridge Daemon                      │
+│                    (纯消息路由器)                             │
+│                                                            │
+│  Agent Registry              Room Manager                  │
+│  ┌──────────────────┐        ┌──────────────────────────┐  │
+│  │ ag-1: claude      │        │ room-A: [ag-1, ag-2]     │  │
+│  │ ag-2: codex       │        │ room-B: [ag-3, ag-4]     │  │
+│  │ ag-3: claude      │        └──────────────────────────┘  │
+│  │ ag-4: codex       │                                      │
+│  │ ag-5: gemini      │        Unassigned state: [ag-5]      │
+│  └──────────────────┘        assignmentState=unassigned     │
+│                                                            │
+│  Control WS :4502            Management API :4503          │
+└──────────┬──────────────┬──────────────┬──────────────┬─────┘
+           │              │              │              │
+      ┌────▼────┐    ┌────▼─────┐   ┌────▼────┐   ┌────▼─────┐
+      │bridge.ts│    │codex-    │   │bridge.ts│   │gemini-   │
+      │(Claude) │    │adapter   │   │(Claude) │   │adapter   │
+      │ ag-1    │    │ ag-2     │   │ ag-3    │   │ ag-5     │
+      └────┬────┘    └────┬─────┘   └────┬────┘   └────┬─────┘
+           │              │              │              │
+      Claude #1      Codex #1       Claude #2      Gemini #1
+```
+
+### 组件清单
+
+| 组件 | 说明 |
+|------|------|
+| **Daemon** | 纯消息路由器，不直接管理任何 agent 运行时 |
+| **Agent Registry** | 维护所有已连接 agent 的身份、类型、状态和能力信息 |
+| **Room Manager** | 管理 room 的创建、成员变更、消息路由作用域 |
+| **Claude bridge / adapter** | 通过 MCP stdio 连接 Claude Code，向 daemon 注册为 agent |
+| **Codex adapter** | 独立进程，管理自己的 Codex app-server，向 daemon 注册为 agent |
+| **其他 adapter** | 如 Gemini adapter，同样作为独立进程连接 daemon |
+
+### 高层关系
+
+- Adapter 通过控制协议连接 daemon。
+- Daemon 追踪 agent 和 room 状态。
+- 消息通过 daemon 路由，而非 runtime 之间直连。
+- 未分配的 agent 可见但不可路由。
+- 多组 room 可以共存且互不干扰。
+
+### 从架构图中可见的关键特性
+
+- 每种 agent 类型有独立的 adapter
+- 多 agent 共存
+- Room 作用域通信
+- Unassigned 是分配状态，不是 room
+- Daemon 不再直接持有 Codex 生命周期
+
+## 4. 核心概念
+
+本章定义系统中的核心对象及其语义边界。协议字段和消息格式在第 5 章定义。
+
+### 概念总览
+
+| 概念 | 定义 |
+|------|------|
+| **Agent** | 连接到 daemon 的逻辑参与者，由 adapter 代表其接入系统。Agent 具有稳定身份和当前连接态两个层次。Agent 是 room 成员关系、分配状态、policy 决策的基本单位。 |
+| **Room** | 消息作用域，而非进程、线程或 runtime 实例。Room 的作用是将通信限制在一组成员内部。Room 是逻辑协作单元，可承载一对一或多 agent 协作。Room 不是 agent 生命周期的拥有者，只是通信拓扑的一部分。 |
+| **Unassigned 状态** | 分配状态，不是 room。新 agent 默认处于 unassigned，直到用户操作或 policy 将其分配到 room。Unassigned 的 agent 对系统可见，但不能因为共享该状态而互相接收消息。此状态的存在是为了发现和分配，不是为了通信。 |
+| **Policy** | 独立于核心路由器的决策层。Policy 可以决定是否自动配对、是否要求 invite accept、是否启用轮次协调、是否做语义路由。Policy 可以读取系统状态并提出动作，但不应改变核心路由器的基础职责边界。Policy 是可插拔的，不应把特定 agent 逻辑硬编码进 daemon。 |
+| **Adapter** | Agent runtime 与 AgentBridge 控制面之间的桥接层。Adapter 负责把某个具体 runtime 的输入输出映射到 AgentBridge 的通用语义。Adapter 可以带有 runtime 特定行为，但这些行为不属于 daemon。不同 agent 类型通过不同 adapter 接入，但在 daemon 看来都表现为统一的 agent 抽象。 |
+
+### Room 成员模型
+
+以下是成员关系的规则层语义，协议流程在第 5 章定义。
+
+- 一个 agent 可以属于多个 room。
+- 一个 agent 可以有一个默认 room，用于没有显式目标时的隐式路由上下文。
+- Room 成员关系是显式关系，不应由"同类型 agent"或"共享 unassigned 状态"隐式推断。
+- 邀请和加入是成员关系建立的基础动作。
+- Invite 默认应是需要接受的语义；自动接受属于 policy 决策，不属于 room 概念本身。
+- Room 可以存在不同角色语义，例如 owner（创建者）、member（普通成员）、observer（只读观察者）。
+- Observer 可以看见 room 信息或消息范围，但是否可发言、是否可邀请他人属于后续协议与权限模型问题。
+- 默认 room 是上下文选择语义，不等于"唯一 room"。
+
+### 概念边界
+
+- Agent 是参与者
+- Adapter 是接入层
+- Room 是通信作用域，而非进程、线程或 runtime 实例
+- Unassigned 是分配状态，不是 room
+- Policy 是决策层；路由器只负责路由
+- Daemon 承载这些抽象作为核心路由器，而非运行时管理器
+
+## 5. 协议设计
+
+本章定义 AgentBridge v2 控制协议的语义与消息结构。协议分为三层：
+
+- **连接层**（5.1-5.3）：版本协商、身份、保活
+- **路由层**（5.4-5.6）：room 操作、消息、事件
+- **横切面**（5.7-5.8）：错误模型、可观测性
+
+### 5.1 版本协商、握手与认证
+
+每个连接以显式的协议版本声明开始。Daemon 可以接受、拒绝或在支持的版本范围内协商。能力声明是握手的一部分，不是事后补充。
+
+**握手请求**（adapter → daemon）：
+
+```typescript
+{
+  type: "handshake",
+  protocolVersion: "2.0",
+  authToken: "daemon-generated-random-token",
+  capabilities: {
+    canReceiveMessages: true,
+    canStreamIntermediateEvents: false,
+    supportsExplicitAddressing: true,
+    supportsOfflineQueue: true,
+    supportsTurnControl: false
+  }
+}
+```
+
+**握手成功**（daemon → adapter）：
+
+```typescript
+{
+  type: "handshake_ok",
+  protocolVersion: "2.0",
+  daemonCapabilities: {
+    broadcast: true,
+    storeIfOffline: true,
+    heartbeat: true
+  },
+  heartbeatIntervalMs: 30000
+}
+```
+
+**握手失败 — 认证错误**：
+
+```typescript
+{
+  type: "error",
+  code: "AUTH_FAILED",
+  message: "Invalid or expired auth token",
+  retryable: false
+}
+```
+
+**握手失败 — 协议版本不兼容**：
+
+```typescript
+{
+  type: "error",
+  code: "PROTOCOL_VERSION_UNSUPPORTED",
+  message: "Server supports versions 2.0-2.1, client requested 3.0",
+  retryable: false
+}
+```
+
+**握手输入：**
+
+握手请求至少包括：`protocolVersion`、`capabilities`、`authToken`，以及可选的 agent 类型与显示名元数据。
+
+**规则：**
+
+- Daemon 生成的本地 token 是必需的。
+- 认证同时适用于新注册和断线重连。
+- 认证回答的是"该进程能否连接 daemon"，不直接定义 room 权限。
+- 能力声明是描述性的，用于路由和 policy 决策，不自动授予权限。
+
+### 5.2 Agent 身份、注册与重连
+
+Agent 身份分为两个层次：
+
+- **稳定逻辑身份**（`agentId`）— 跨重连保持不变，代表一个持续存在的逻辑参与者
+- **临时会话连接**（`sessionId`）— 代表当前的 WebSocket 连接，每次重连都会更换
+
+**新注册**（握手成功后）：
+
+```typescript
+// 请求
+{
+  type: "agent_register",
+  agentType: "claude" | "codex" | "gemini" | string,
+  name?: "Claude #1"
+}
+
+// 响应
+{
+  type: "agent_registered",
+  agentId: "ag-7",
+  sessionId: "sess-42",
+  resumeToken: "rtok-abc123",
+  assignmentState: "unassigned"
+}
+```
+
+**断线重连**（使用稳定身份 + 恢复凭证）：
+
+```typescript
+// 请求
+{
+  type: "agent_resume",
+  agentId: "ag-7",
+  resumeToken: "rtok-abc123"
+}
+
+// 成功
+{
+  type: "agent_resumed",
+  agentId: "ag-7",
+  sessionId: "sess-43",
+  resumeToken: "rtok-def456",
+  assignmentState: "assigned",
+  rooms: ["room-3"],
+  defaultRoomId: "room-3",
+  pendingMessages: [...]
+}
+```
+
+**重连失败**：
+
+```typescript
+{
+  type: "error",
+  code: "RESUME_TOKEN_INVALID",
+  message: "Resume token expired or invalid, please re-register",
+  retryable: false
+}
+```
+
+**身份状态转换：**
+
+- 新注册 → agent 获得稳定身份，进入 unassigned 状态
+- 正常断开 → 稳定身份保留，会话连接释放
+- 重连恢复 → 验证恢复凭证，恢复 room 成员关系、分配状态、默认 room 上下文
+- 恢复失败 → 应拒绝该恢复请求，而不是静默降级为新注册
+- 冲突会话 → 如果同一稳定身份已有活跃会话，应拒绝或替换旧会话
+
+**重连时恢复的状态：**
+
+- Room 成员关系
+- 分配状态
+- 默认 room 上下文
+- 待投递消息（如果支持 `store_if_offline`）
+
+### 5.3 心跳
+
+心跳用于检测失活会话，区分暂时沉默和连接断开，并触发离线语义和重连资格判定。
+
+**心跳消息对：**
+
+```typescript
+{ type: "ping", timestamp: 1711000000000 }
+{ type: "pong", timestamp: 1711000000000 }
+```
+
+**超时语义：**
+
+- 超过 `heartbeatIntervalMs × 2` 未收到 pong，会话状态从 healthy 转为 suspect
+- 继续未响应，转为 offline
+- Offline 触发 `agent_offline` 事件（事件定义在 5.6）
+
+**与重连的关系：**
+
+- 心跳超时使当前会话连接失效
+- 稳定逻辑身份仍可通过有效的恢复凭证重连
+
+**运维要求：**
+
+- Daemon 和 adapter 双方都必须支持心跳
+- 心跳策略应对称，或者如果不对称需明确文档化
+
+### 5.4 Room 管理
+
+Room 的生命周期操作通过以下协议消息完成：
+
+```typescript
+// 创建 room
+{ type: "room_create", name?: string }
+// → { type: "room_created", roomId: "room-3", owner: "ag-1" }
+
+// 自己加入
+{ type: "room_join", roomId: "room-3" }
+// → { type: "room_joined", roomId: "room-3" }
+
+// 邀请其他 agent（可指定角色）
+{ type: "room_invite", roomId: "room-3", agentId: "ag-5", role?: "member" | "observer" }
+// → 被邀请方收到：
+{ type: "room_invite_received", roomId: "room-3", from: "ag-1", role: "member" }
+
+// 接受邀请
+{ type: "room_invite_accept", roomId: "room-3" }
+
+// 拒绝邀请
+{ type: "room_invite_decline", roomId: "room-3", reason?: string }
+
+// 离开 room
+{ type: "room_leave", roomId: "room-3" }
+
+// 设置默认 room
+{ type: "room_set_default", roomId: "room-3" }
+
+// 列出所有 room
+{ type: "room_list" }
+// → { type: "room_list_result", rooms: [{ roomId, name, owner, members: [{ agentId, agentType, name, role }] }] }
+
+// 列出所有 agent
+{ type: "agent_list" }
+// → { type: "agent_list_result", agents: [{ agentId, agentType, name, assignmentState, rooms: [...], defaultRoomId? }] }
+```
+
+**成员关系语义：**
+
+- Agent 可以属于多个 room。
+- 每个 agent 最多有一个默认 room。
+- Room 成员关系是显式的。
+- Invite 默认需要接受。
+
+**角色语义：**
+
+- `owner` — room 创建者
+- `member` — 普通成员，可发送和接收消息
+- `observer` — 可接收消息，具体发言权限由后续权限模型定义
+
+**分配状态关系：**
+
+- Unassigned 不是 room。
+- 加入 room 改变分配状态。
+- 离开最后一个 room 可能使 agent 回到 unassigned 状态。
+
+**列表语义：**
+
+- `room_list` 和 `agent_list` 的返回值应包含足够的元数据，供 UI 和 policy 做决策。
+
+### 5.5 消息信封
+
+```typescript
+// Room 内广播
+{
+  type: "message",
+  protocolVersion: "2.0",
+  messageId: "msg-uuid-1",
+  traceId: "trace-xyz",
+  idempotencyKey: "idk-abc",
+  roomId: "room-3",
+  from: {
+    agentId: "ag-2",
+    sessionId: "sess-22",
+    agentType: "codex",
+    name: "Codex"
+  },
+  content: "请审查这个补丁。",
+  timestamp: 1711000000000,
+  deliveryMode: "online_only",
+  ack: { requested: true }
+}
+
+// 定向投递（使用 to 缩小接收范围）
+{
+  type: "message",
+  protocolVersion: "2.0",
+  messageId: "msg-uuid-2",
+  traceId: "trace-abd",
+  idempotencyKey: "idk-def",
+  roomId: "room-3",
+  from: {
+    agentId: "ag-1",
+    sessionId: "sess-30",
+    agentType: "claude",
+    name: "Claude"
+  },
+  to: { agentIds: ["ag-2"] },
+  mentions: ["ag-2"],
+  content: "@codex: 关注那个失败的测试。",
+  timestamp: 1711000001000,
+  deliveryMode: "store_if_offline",
+  ack: { requested: true }
+}
+
+// 消息回执
+{
+  type: "message_ack",
+  protocolVersion: "2.0",
+  messageId: "msg-uuid-2",
+  traceId: "trace-abd",
+  roomId: "room-3",
+  fromAgentId: "ag-2",
+  status: "accepted" | "delivered" | "queued" | "dropped" | "failed",
+  timestamp: 1711000002000
+}
+```
+
+**核心消息标识：**
+
+- `messageId` — 全局唯一消息 ID，用于去重和回执
+- `traceId` — 跨 agent 追踪 ID，一次完整的请求-响应链共享同一个 traceId
+- `idempotencyKey` — 幂等键，防止重试导致重复投递
+
+**路由作用域：**
+
+- `roomId` — 消息所属 room
+- `from` — 发送方身份块
+- `to` — 可选，显式缩小 room 内的接收方范围
+- `mentions` — 可选，信息性或工作流相关的 @提及，不等同于 `to`
+
+**投递语义：**
+
+- `deliveryMode` 必须为每条消息显式指定
+- `online_only` — 接收方离线时丢弃
+- `store_if_offline` — 入队，重连后投递
+
+**回执语义：**
+
+- `ack.requested` 允许发送方请求结构化的投递确认
+- 回执状态包括：`accepted`、`delivered`、`queued`、`dropped`、`failed`
+
+**幂等语义：**
+
+- 重复发送不应产生重复的逻辑投递
+- 重试时应保持逻辑身份规则
+
+**显式寻址语义：**
+
+- `to` 在 room 作用域内缩小接收方范围
+- `mentions` 是信息性标记，有工作流意义但不等同于 `to`
+
+### 5.6 事件通知
+
+事件通知用于传达状态变更，不是普通对话消息。
+
+**在线状态事件：**
+
+```typescript
+{ type: "agent_online", agentId: "ag-5", sessionId: "sess-30", agentType: "gemini", name: "Gemini" }
+{ type: "agent_offline", agentId: "ag-5", reason: "disconnect" | "heartbeat_timeout" | "process_exit" }
+```
+
+**Room 和分配状态事件：**
+
+```typescript
+{ type: "room_updated", roomId: "room-3", members: [{ agentId, agentType, name, role }] }
+{ type: "assignment_updated", agentId: "ag-5", assignmentState: "unassigned" | "assigned" }
+```
+
+**事件受众：**
+
+- `agent_online` / `agent_offline` — 所有已连接的 agent
+- `room_updated` — 该 room 的所有成员
+- `assignment_updated` — 受影响的 agent 本身
+
+**事件用途：**
+
+- 事件通知状态变更
+- 事件不是普通对话消息
+
+### 5.7 错误模型
+
+所有错误使用统一的结构化信封：
+
+```typescript
+{
+  type: "error",
+  protocolVersion: "2.0",
+  code: string,
+  message: string,
+  retryable: boolean,
+  details?: Record<string, unknown>,
+  requestType?: string
+}
+```
+
+**错误行为语义：**
+
+- 会话终止型错误：`AUTH_FAILED`、`PROTOCOL_VERSION_UNSUPPORTED` — 连接应关闭
+- 请求作用域错误：`ROOM_NOT_FOUND`、`AGENT_NOT_FOUND` — 仅当前请求失败
+- 可重试错误：`retryable: true` 表示客户端可以安全重试
+
+**错误码表：**
+
+| 错误码 | 分类 | 说明 |
+|--------|------|------|
+| `AUTH_FAILED` | 认证 | 认证 token 无效或过期 |
+| `PROTOCOL_VERSION_UNSUPPORTED` | 协议 | 协议版本不兼容 |
+| `CAPABILITY_DECLARATION_INVALID` | 协议 | 能力声明格式错误 |
+| `RESUME_TOKEN_INVALID` | 恢复 | 恢复凭证已过期或无效 |
+| `ROOM_NOT_FOUND` | Room | 目标 room 不存在 |
+| `ROOM_INVITE_REQUIRES_ACCEPT` | Room | 邀请需要被邀请方接受 |
+| `AGENT_NOT_FOUND` | Agent | 目标 agent 不存在 |
+| `DELIVERY_FAILED` | 投递 | 消息投递失败 |
+| `MESSAGE_DUPLICATE` | 幂等 | 重复的 idempotencyKey |
+| `INVALID_REQUEST` | 通用 | 请求格式错误 |
+
+**协议示例：**
+
+```typescript
+// 请求作用域 room 错误
+{
+  type: "error",
+  code: "ROOM_NOT_FOUND",
+  message: "Room room-99 does not exist",
+  retryable: false,
+  requestType: "room_join"
+}
+
+// 认证失败错误
+{
+  type: "error",
+  code: "AUTH_FAILED",
+  message: "Authentication failed",
+  retryable: false
+}
+```
+
+### 5.8 可观测性要求
+
+**必需标识符：**
+
+每条消息和事件必须携带以下字段：
+
+- `messageId` — 全局唯一消息 ID
+- `traceId` — 跨 agent 追踪 ID
+- `roomId` — 消息所属 room
+- `fromAgentId` — 消息发送方
+
+**推荐标识符：**
+
+- `sessionId` — 当前会话连接标识
+- `deliveryMode` — 投递模式
+- 目标标识符（`to` 中的 agentIds）
+- Policy 决策元数据（如 `policyName`、`decisionReason`）
+
+**日志关联要求：**
+
+- Daemon 日志和 adapter 日志必须可关联
+- 一条消息应能跨路由、policy 和 adapter 边界被追踪
+
+**可观测性覆盖范围：**
+
+- 请求与响应
+- 事件通知
+- 消息回执
+- 错误
+
+**用途：**
+
+- 调试
+- 重放分析
+- 投递问题排查
+- 多 agent 协调可见性
+
+## 6. 用户体验流程
+
+本章从用户视角描述几个代表性场景，说明 v2 架构下的交互体验。
+
+### 场景 1：简单配对流程
+
+```
+1. 用户启动 Claude Code #1
+   → bridge.ts 连接 daemon，注册为 ag-1 (claude)
+   → 状态：unassigned
+   → 用户看到："已注册为 ag-1，当前未分配"
+
+2. 用户启动 Codex #1
+   → codex-adapter 连接 daemon，注册为 ag-2 (codex)
+   → 状态：unassigned
+   → Claude #1 看到："新 agent 上线：ag-2 (codex)，未分配"
+
+3. 用户说"和 ag-2 配对"（或 AutoPairPolicy 自动触发）
+   → 创建 room-1，ag-1 和 ag-2 加入
+   → 两者开始通信
+```
+
+### 场景 2：多组配对
+
+```
+4. 用户启动 Claude Code #2 + Codex #2
+   → 注册为 ag-3、ag-4，都进入 unassigned
+   → 不影响 room-1 中 ag-1 和 ag-2 的通信
+
+5. 用户对 Claude #2 说"和 ag-4 配对"
+   → 创建 room-2: [ag-3, ag-4]
+   → 两组各自独立通信，互不干扰
+```
+
+### 场景 3：多 room 上下文
+
+```
+6. ag-1 同时属于 room-1 和 room-2
+   → 用户回复时，系统通过 chat context 或默认 room 解析隐式目标
+   → 没有显式目标时，消息发往 defaultRoomId
+   → 用户可以通过 set_default_room 切换默认上下文
+```
+
+### 场景 4：发现与分配
+
+```
+7. 新 agent ag-5 (gemini) 上线
+   → 所有已连接 agent 收到通知："ag-5 (gemini) 上线，未分配"
+   → 用户可以看到其未分配状态
+   → 未分配不是可通信房间，只是等待用户或 policy 进行分配
+   → 用户决定将其分配到已有 room 或创建新 room
+```
+
+### 场景 5：掉线与恢复
+
+```
+8. ag-2 (codex) 掉线
+   → 用户看到："ag-2 已离线"
+   → room-1 本身不会因此崩解
+   → ag-1 仍在 room-1 中，可以继续接收其他成员的消息
+
+9. ag-2 重连
+   → 恢复 room-1 成员关系和上下文
+   → 用户体验尽量连续，如同短暂中断
+```
+
+## 7. MCP 工具变化
+
+v2 将 MCP 工具从单一 `reply` 扩展为一组最小化、可组合的控制操作。
+
+### 工具表
+
+| 工具 | 用途 |
+|------|------|
+| `reply(chat_id, text)` | 向后兼容的回复。通过 chat context 解析目标 room，无绑定时 fallback 到默认 room |
+| `agents()` | 列出所有在线 agent、类型、分配状态和默认 room |
+| `rooms()` | 列出所有 room、成员、owner 和默认 room 绑定 |
+| `create_room(name?)` | 创建 room |
+| `invite(room_id, agent_id)` | 邀请 agent 加入 room |
+| `accept_invite(room_id)` | 接受邀请 |
+| `decline_invite(room_id, reason?)` | 拒绝邀请 |
+| `leave(room_id)` | 离开 room |
+| `set_default_room(room_id)` | 设置后续回复的隐式目标 room |
+
+### 工具设计原则
+
+- 工具暴露用户可感知的控制操作，而非底层传输细节。
+- 工具集保持最小化和可组合。
+- 单 room 简单模式应保持简单；多 room 模式应保持显式。
+- 现有的单 room 工作流应继续以最小用户摩擦运作。
+
+## 8. Adapter 独立化
+
+Adapter 是 agent runtime 与 AgentBridge 控制面之间的桥接层。v2 中，adapter 成为独立进程，不再由 daemon 管理其生命周期。
+
+### 8.1 Adapter 职责
+
+**运行时桥接：**
+
+- Adapter 负责与特定 runtime 的集成。
+- Adapter 将 runtime 的输入输出翻译为 AgentBridge 协议语义。
+- Adapter 接收路由消息，并将 runtime 的输出转化为协议消息或事件。
+
+**生命周期所有权：**
+
+- Adapter 可以启动并管理自己的 runtime 进程。
+- Adapter 负责 runtime 特定的连接处理。
+- Adapter 负责将 runtime 状态报告回控制面。
+
+**隔离性：**
+
+- 多个 adapter 可以独立运行。
+- 一个 adapter 的故障不应导致无关的 room 或其他 adapter 崩溃。
+- Daemon 通过统一的控制面契约看待所有 adapter。
+
+**示例：**
+
+- Claude bridge / adapter — 通过 MCP stdio 连接 Claude Code
+- Codex adapter — 独立管理 Codex app-server
+- Gemini adapter — 独立管理 Gemini CLI
+
+### 8.2 运行时特定约束
+
+不同的 runtime 不像通用消息总线那样工作。某些 runtime 是串行的、有状态的或基于轮次的。这些约束属于 adapter，不属于 daemon。
+
+**Codex 特定约束：**
+
+- Codex turn 执行实质上是串行的。
+- Adapter 必须管理输入串行化。
+- Adapter 必须提供背压机制，而非盲目注入并发工作。
+- Adapter 可能需要本地 inbox 或队列语义。
+
+**通用规则：**
+
+- 运行时特定约束属于 adapter，不属于 daemon。
+- Daemon 路由通用协议消息，不嵌入运行时特定的执行策略。
+
+**未来扩展性：**
+
+- 其他 adapter（如 Gemini）可能引入不同的约束。
+- 架构应允许这些差异存在，而不需要修改 daemon 抽象。
+
+## 9. 运维闭环
+
+架构设计不完整，除非本地运行时闭环也被关闭。本章定义系统在本地如何运行。
+
+### 9.1 启动与守护
+
+**谁启动什么：**
+
+- Daemon 由 `bridge.ts` 在首次启动时自动拉起（保持现有行为），或由用户通过 CLI 手动启动。
+- Adapter 在简单模式下可由 bridge 或 launcher 帮忙拉起，保持"开箱即用"体验。
+- 多 agent 模式下，用户通过 `agentbridge start codex` 等 CLI 命令显式启动特定 adapter。
+
+**谁守护什么：**
+
+- Adapter 失败后由自身负责重启，使用有界退避（bounded backoff）策略。
+- 可选地集成 systemd / launchd 作为外部 supervisor。
+- Daemon 不默认重新变成 runtime supervisor，除非明确恢复这个职责。
+
+**期望行为：**
+
+- 简单模式尽量保持"just works"体验。
+- 多 agent 模式提供更显式的启动和管理方式。
+
+### 9.2 Daemon 发现与 Token 分发
+
+**发现机制：**
+
+- Adapter 默认连接 `ws://127.0.0.1:4502`。
+- 可通过环境变量 `AGENTBRIDGE_DAEMON_URL` 覆盖。
+- Daemon 启动时写入发现元数据文件（如 `/tmp/agentbridge-daemon.json`），包含 endpoint、PID、协议版本。
+
+**Token 分发：**
+
+- Daemon 启动时生成随机 auth token，写入本地文件（如 `/tmp/agentbridge-auth-token`，权限 600）。
+- Adapter 启动时读取该文件获得 token。
+- 简单模式下的 launcher 负责向 child adapter 传递发现和认证元数据。
+
+**安全姿态：**
+
+- 发现元数据文件必须限制为本地用户私有。
+- Token 在 daemon 重启后应轮换。
+- 发现机制是运维入口，不是协议本身。
+
+### 9.3 端口分配与陈旧进程清理
+
+**端口策略：**
+
+- 每个 adapter 的 app-server 和 proxy 端口动态分配（port 0）或在预留范围内选取。
+- 端口所有权归属到具体的 adapter session。
+- 实际端口在注册时上报给 daemon。
+
+**陈旧进程清理：**
+
+- 启动时检测并识别陈旧进程和孤儿进程。
+- 区分活跃冲突进程和陈旧孤儿 — 不能把活进程当垃圾杀掉。
+- 释放旧 metadata 和旧端口占用。
+- PID 文件 + 启动时校验作为基础清理手段。
+
+### 9.4 资源限额
+
+| 资源 | 建议限额 |
+|------|----------|
+| 每个 daemon 的最大 adapter 数 | 可配置，默认 16 |
+| 每个 agent 的最大待投递消息数 | 可配置，默认 1000 |
+| 每个 room 的最大成员数 | 可配置，默认 32 |
+| 日志文件大小 | 按大小轮转，默认 10MB |
+| 后台进程数 | 软警告 + 硬拒绝 |
+
+**达到限额时的行为：**
+
+- 软警告：通知用户资源接近上限。
+- 硬拒绝：拒绝新 adapter 注册或新消息入队。
+- 日志和留存策略有界。
+
+## 10. 自动配对 Policy 层
+
+Policy 是独立于核心路由器的决策层。Policy 读取系统状态并提出动作建议，但不改变路由器的基础职责边界。
+
+### Policy 接口定义
+
+**输入：**
+
+- 当前 agent registry 视图
+- Room 状态
+- 分配状态
+- 触发事件或消息上下文
+- 可选的能力元数据
+
+**输出：**
+
+- 建议动作列表，例如：
+  - 将这些 agent 配对
+  - 要求 invite accept
+  - 设置默认 room
+  - 路由到显式目标
+  - 抑制或延迟某个动作
+
+**执行模型：**
+
+- Policy 是可插拔的。
+- 可以串联或组合多个 policy。
+- Router 仍然负责最终执行与校验。
+
+### 内置 Policy
+
+| Policy | 说明 |
+|--------|------|
+| **AutoPairPolicy** | 简单模式下自动把兼容 agent 配成对。不应在复杂多 room 情况下暗中制造歧义。 |
+| **ManualAssignmentPolicy** | 默认保守策略，需要显式用户动作完成配对或分配。 |
+| **SemanticRoutePolicy** | 根据消息意图或上下文建议目标。不应替代显式寻址。 |
+| **TurnCoordinationPolicy** | 控制轮次交替，限制失控的来回循环。 |
+
+### 与 v1.3 Thinking Patterns 的承接
+
+v1.3 在单桥路径上通过 prompt contract 提供了 Role Contract + Thinking Patterns（Independent Analysis & Convergence、Architect→Builder→Critic、Hypothesis→Experiment→Interpretation）。这些协作模式在 v2 中不会被废弃，而是建立在多 agent 基础设施之上：
+
+- Policy layer 未来可支持 role-aware collaboration patterns 和 multi-agent thinking patterns
+- v1.3 的 prompt-based patterns 作为概念基础，v2/v3 将其正式化为 policy 驱动的协作协议
+- 详见 [v1 路线图 §5 v1.3](v1-roadmap.zh-CN.md)
+
+### Policy 约束
+
+- Policy 可以建议，不应越权。
+- Room 权限仍需由 router / protocol / authorization 校验。
+- Policy 失败不应破坏基础路由能力。
+- Policy 决策应可观测、可解释。
+
+## 11. 向后兼容与迁移路线图
+
+### 兼容性目标
+
+- 简单模式尽量保持当前用户体验。
+- 现有的单 room reply 驱动的工作流应继续工作。
+- 兼容性是行为层优先，不要求永久的 wire 兼容。
+
+### 五阶段路线图
+
+| 阶段 | 核心变化 | 兼容性预期 | 主要风险 |
+|------|----------|------------|----------|
+| **Phase 1: 内部重构** | 在现有 daemon 内引入 `AgentRegistry`、`RoomManager`、`ConnectionSession` | 外部行为不变，用户无感知 | 内部结构变化但外部行为需保持稳定 |
+| **Phase 2: 协议落地** | 定义并实现 v2 控制协议，保留旧路径或兼容层 | 旧 adapter 仍可连接 | 新旧协议并存复杂度 |
+| **Phase 3: Room 与 Policy** | 加入 room 模型、默认上下文、policy hooks | 简单模式自动配对，多 agent 真正可用 | 隐式行为和显式行为冲突 |
+| **Phase 4: 持久化与恢复** | SQLite 存储身份、room、pending delivery | 断线恢复进入可信阶段 | 重复恢复、数据不一致、schema 迁移 |
+| **Phase 5: 高级能力** | 将 v1 单桥体验模式（过滤、协调、协作模式）正式升级为多 agent 能力；Gemini 集成 | 基于稳定协议和 v1 经验构建 | 高级能力污染基础抽象 |
+
+### 兼容性保证与非目标
+
+**保留的行为：**
+
+- 单 Claude + 单 Codex 的自动配对体验
+- `reply(chat_id, text)` 的基本使用方式
+- `bridge.ts` 自动拉起 daemon 的启动路径
+
+**临时兼容（最终会移除）：**
+
+- 旧协议兼容层（Phase 2 引入，Phase 3 后弃用）
+
+**不会继续背负的旧限制：**
+
+- 单一 `attachedClaude` 连接模型
+- Daemon 管理 Codex 生命周期
+- 全局一对一路由
+
+## 12. 持久化与安全
+
+本章定义什么需要持久化、何时写入、如何恢复，以及本地安全假设。
+
+### 12.1 SQLite 数据模型
+
+**为什么选 SQLite：**
+
+- 崩溃恢复安全（ACID 事务）
+- 并发读写安全
+- 事务语义保证
+- 支持 schema 迁移
+- 内置 WAL 模式提升性能
+
+**核心表：**
+
+| 表 | 存储内容 |
+|------|----------|
+| `agents` | agentId、agentType、name、能力声明、resumeToken、lastSeen |
+| `sessions` | sessionId、agentId、连接时间、在线状态 |
+| `rooms` | roomId、name、owner、createdAt |
+| `room_members` | roomId、agentId、role、joinedAt |
+| `default_room_bindings` | agentId、defaultRoomId |
+| `pending_messages` | messageId、roomId、targetAgentId、content、deliveryMode、createdAt、expiresAt |
+| `resume_metadata` | agentId、resumeToken、issuedAt、expiresAt |
+| `schema_version` | version |
+
+**持久化 vs 不持久化：**
+
+- 持久化：逻辑身份、room 关系、pending delivery、resume 凭证
+- 不持久化：短暂的 runtime 内部状态、实时心跳计时器
+
+### 12.2 写入时机、清理与恢复顺序
+
+**写入时机：**
+
+| 事件 | 写入内容 |
+|------|----------|
+| Agent 注册 | `agents` + `sessions` + `resume_metadata` |
+| Room 变更 | `rooms` + `room_members` |
+| 设置默认 room | `default_room_bindings` |
+| 消息入队（store_if_offline） | `pending_messages` |
+| 消息投递成功 / ack | 删除对应 `pending_messages` 记录 |
+| Agent 断开 / 超时 | 更新 `sessions` 状态 |
+
+**清理策略：**
+
+- 陈旧 session 记录：agent 超过 24h 未连接时清理
+- 过期 pending delivery：TTL 1h 后清理
+- 过期 resume metadata：token 过期后清理
+- 空 room：所有成员离开后保留 1h，然后清理
+
+**恢复顺序：**
+
+Daemon 启动后按以下顺序恢复：
+
+1. 身份（`agents` + `resume_metadata`）
+2. Room 和成员关系（`rooms` + `room_members`）
+3. 默认 room 绑定（`default_room_bindings`）
+4. 待投递消息（`pending_messages`，仅未过期的）
+5. 可恢复的 session 元数据
+
+> 必须避免"消息先于拓扑恢复"的问题 — 先恢复拓扑，再恢复消息。
+
+### 12.3 安全注意事项
+
+**本地认证：**
+
+- Daemon 启动时生成随机 auth token。
+- 新注册和断线重连都需要 auth。
+
+**本地元数据保护：**
+
+- 发现元数据和 token 引用文件必须限制为本地用户可读（权限 600）。
+- 避免暴露在共享目录或宽权限文件中。
+
+**审计能力：**
+
+以下操作应有结构化审计日志：
+
+- Room 变更（创建、成员变更、删除）
+- 显式路由操作
+- 认证或恢复失败
+
+**安全声明范围：**
+
+- 本系统是本地单用户信任模型优先。
+- 不宣称解决跨主机或强对抗场景下的安全问题。
+
+## 13. 连接互踢问题的解决
+
+**根因**：当前 daemon 只有一个 `attachedClaude` 指针，新连接必然替换旧连接。
+
+**解决方案**：
+
+- 用 `AgentRegistry: Map<agentId, AgentInfo>` 替代单一的 `attachedClaude`。
+- 用 `sessionId` 追踪每个活跃连接，而非将其作为逻辑身份。
+- 将路由绑定到 room 成员关系和显式寻址，而非一个全局出口。
+- 未分配的 agent 保持隔离，直到 policy 或用户操作将其分配。
+
+```
+启动 Claude Code 1  → 注册为 ag-1，assignmentState=unassigned
+启动 Codex 1        → 注册为 ag-2，AutoPairPolicy 配对 → room-1: [ag-1, ag-2]
+启动 Codex 2        → 注册为 ag-3，保持 unassigned
+启动 Claude Code 2  → 注册为 ag-4，AutoPairPolicy 配对 ag-3 → room-2: [ag-3, ag-4]
+
+结果：两组独立通信，无连接替换副作用 ✅
+```
+
+## 14. 下一步
+
+1. **立即可开工**：Phase 1 内部重构 — 将 `attachedClaude` 拆为 `AgentRegistry` + `RoomManager` + `ConnectionSession`，保留当前 1:1 行为不变。
+2. **协议收敛**：基于本文档的协议设计（第 5 章），产出正式的 v2 control protocol 草案，包含完整的状态机转换图、错误码表和恢复流程时序图。
+3. **Adapter 开发**：协议稳定后，开发独立的 codex-adapter 和 gemini-adapter。
+4. **验证与迭代**：在真实多 agent 场景下验证协议设计，根据实践反馈迭代。

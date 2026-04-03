@@ -1,0 +1,24 @@
+{
+  "name": "claude-codex-loop",
+  "owner": {
+    "name": "Claude Codex Loop Contributors",
+    "email": "raysonmeng@qq.com",
+    "url": "https://github.com/liuyue/claude-codex-loop"
+  },
+  "metadata": {
+    "description": "Marketplace for the Claude Codex Loop Claude Code plugin and supporting runtime integration."
+  },
+  "plugins": [
+    {
+      "name": "claude-codex-loop",
+      "description": "Run Claude/Codex collaboration loops through a shared daemon, push channel delivery, and iterative workflow tools.",
+      "version": "0.1.4",
+      "author": {
+        "name": "Claude Codex Loop Contributors",
+        "email": "raysonmeng@qq.com"
+      },
+      "source": "./plugins/claude-codex-loop",
+      "category": "development"
+    }
+  ]
+}

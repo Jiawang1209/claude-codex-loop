@@ -1,0 +1,12 @@
+{
+  "name": "claude-codex-loop",
+  "version": "0.1.4",
+  "description": "Run Claude/Codex collaboration loops with a shared daemon, push channel delivery, and iterative reply/wait tooling.",
+  "author": {
+    "name": "Claude Codex Loop Contributors",
+    "email": "raysonmeng@qq.com"
+  },
+  "homepage": "https://github.com/liuyue/claude-codex-loop#readme",
+  "repository": "https://github.com/liuyue/claude-codex-loop",
+  "license": "MIT"
+}

@@ -1,0 +1,46 @@
+{
+  "name": "claude-codex-loop",
+  "version": "0.1.4",
+  "description": "Claude/Codex collaboration loop runtime for structured coding, review, and turn-based workflows",
+  "type": "module",
+  "bin": {
+    "claude-codex-loop": "dist/cli.js",
+    "ccl": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "plugins/",
+    ".claude-plugin/",
+    "scripts/postinstall.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "bun run src/bridge.ts",
+    "build:cli": "mkdir -p dist && bun build src/cli.ts --outfile dist/cli.js --target bun && chmod +x dist/cli.js",
+    "build:plugin": "mkdir -p plugins/claude-codex-loop/server && bun build src/bridge.ts --outfile plugins/claude-codex-loop/server/bridge-server.js --target bun && bun build src/daemon.ts --outfile plugins/claude-codex-loop/server/daemon.js --target bun",
+    "postinstall": "node scripts/postinstall.cjs",
+    "prepublishOnly": "bun run build:cli && bun run build:plugin",
+    "validate:plugin": "claude plugin validate plugins/claude-codex-loop && claude plugin validate .claude-plugin/marketplace.json",
+    "test": "bun test src",
+    "typecheck": "tsc --noEmit",
+    "validate:plugin-versions": "bun scripts/check-plugin-versions.js",
+    "check": "tsc --noEmit && bun test src && bun run build:plugin && bun scripts/check-plugin-versions.js"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "mcp",
+    "agent",
+    "bridge",
+    "multi-agent",
+    "channels"
+  ],
+  "author": "Claude Codex Loop Contributors",
+  "license": "MIT",
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@types/bun": "^1.3.11",
+    "typescript": "^5.8.0"
+  }
+}
